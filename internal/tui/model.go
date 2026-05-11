@@ -2,14 +2,20 @@ package tui
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"gocrack/internal/config"
 	"gocrack/internal/planner"
@@ -48,11 +54,15 @@ type model struct {
 	selectedHashes     map[int]map[string]scanner.FileRef
 	selectedWordlists  map[string]scanner.FileRef
 	selectedProcessors map[string]bool
+	manualHashMode     int
+	manualHash         string
+	manualHashSelected bool
 
 	filtering bool
 	filter    textinput.Model
 	editField string
 	edit      textinput.Model
+	hashEdit  textarea.Model
 
 	options  planner.Options
 	seedText string
@@ -107,6 +117,14 @@ func New(root string, cfg config.Settings, inv scanner.Inventory, tempDir string
 	edit.Prompt = "> "
 	edit.CharLimit = 4096
 
+	hashEdit := textarea.New()
+	hashEdit.Placeholder = "one hash per line"
+	hashEdit.Prompt = ""
+	hashEdit.ShowLineNumbers = true
+	hashEdit.CharLimit = 8 * 1024 * 1024
+	hashEdit.SetHeight(8)
+	hashEdit.SetWidth(80)
+
 	m := model{
 		root:               root,
 		cfg:                cfg,
@@ -116,8 +134,10 @@ func New(root string, cfg config.Settings, inv scanner.Inventory, tempDir string
 		selectedHashes:     map[int]map[string]scanner.FileRef{},
 		selectedWordlists:  map[string]scanner.FileRef{},
 		selectedProcessors: map[string]bool{},
+		manualHashMode:     cfg.Mode,
 		filter:             filter,
 		edit:               edit,
+		hashEdit:           hashEdit,
 		options: planner.Options{
 			Loopback:        cfg.Loopback,
 			Kernel:          cfg.Kernel,
@@ -141,9 +161,22 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.editField == "manual_hash" {
+		if _, ok := msg.(tea.WindowSizeMsg); !ok {
+			if key, ok := msg.(tea.KeyMsg); ok {
+				return m.updateEdit(key)
+			}
+			var cmd tea.Cmd
+			m.hashEdit, cmd = m.hashEdit.Update(msg)
+			return m, cmd
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if m.editField == "manual_hash" {
+			m.configureManualHashEditor()
+		}
 		return m, nil
 	case runMsg:
 		ev := runner.Event(msg)
@@ -241,6 +274,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "right", "enter":
 			if m.step == stepTargets && msg.String() == "right" && m.targetFocus == 0 {
 				m.targetFocus = 1
+			} else if m.step == stepTargets && msg.String() == "enter" && m.targetFocus == 1 && m.isManualModeCursor() {
+				m.beginEdit()
 			} else {
 				m.nextStep()
 			}
@@ -364,7 +399,7 @@ func (m model) help() string {
 	case stepHome:
 		return mutedStyle.Render("homepage | arrows/mouse choose attack | space selects | / filters | enter configures | q quits")
 	case stepTargets:
-		return mutedStyle.Render("arrows move | tab switches mode/hash pane | space selects | / filters | enter continues | q quits")
+		return mutedStyle.Render("arrows move | tab switches panes | manual row supports e/enter editing | space selects | / filters")
 	case stepOptions:
 		return mutedStyle.Render("arrows move | space toggles | +/- changes numbers | e edits text fields | enter continues")
 	case stepQueue:
@@ -384,9 +419,22 @@ func (m model) promptLine() string {
 		return m.filter.View()
 	}
 	if m.editField != "" {
+		if m.editField == "manual_hash" {
+			return m.manualHashEditorView()
+		}
 		return m.edit.View()
 	}
 	return m.help()
+}
+
+func (m model) manualHashEditorView() string {
+	width := max(1, m.width-4)
+	content := strings.Join([]string{
+		panelTitle("Manual hashes", true),
+		mutedStyle.Render("enter adds a line | ctrl+s saves | esc cancels"),
+		m.hashEdit.View(),
+	}, "\n")
+	return boxStyle.Width(width).Render(content)
 }
 
 func (m model) bodyHeight() int {
@@ -406,8 +454,7 @@ func (m model) pageSize() int {
 }
 
 func (m model) viewTargets() string {
-	leftW := max(28, m.width/3)
-	rightW := max(40, m.width-leftW-5)
+	leftW, rightW := splitPaneWidths(m.width, m.width/3, 28, 40)
 	contentH := m.bodyContentHeight()
 	modeLines := []string{panelTitle("Hash modes", m.targetFocus == 0)}
 	for i, g := range m.inv.Modes {
@@ -419,26 +466,46 @@ func (m model) viewTargets() string {
 	if len(m.inv.Modes) == 0 {
 		modeLines = append(modeLines, errorStyle.Render("No hash modes found under "+m.cfg.Hashes))
 	}
+	manualSelected := m.manualHashSelected && len(manualHashLines(m.manualHash)) > 0
+	manualLine := checkboxLine(
+		m.isManualModeCursor() && m.targetFocus == 0,
+		manualSelected,
+		"Manual",
+		fmt.Sprintf("mode %d", m.manualHashMode),
+		leftW-4,
+	)
+	modeLines = append(modeLines, manualLine)
 
 	hashLines := []string{panelTitle("Hash files", m.targetFocus == 1)}
-	files := m.filteredHashFiles()
-	start, end := windowRange(m.hashCursor, len(files), contentH-1)
-	for i := start; i < end; i++ {
-		f := files[i]
-		mode := m.currentMode()
-		selected := m.selectedHashes[mode] != nil && m.selectedHashes[mode][f.Path].Path != ""
-		cursor := i == m.hashCursor && m.targetFocus == 1
-		line := checkboxLine(cursor, selected, f.Rel, scanner.FormatSize(f.Size), rightW-4)
-		hashLines = append(hashLines, line)
-	}
-	if len(files) == 0 {
-		hashLines = append(hashLines, mutedStyle.Render("No files in selected mode or filter."))
+	if m.isManualModeCursor() {
+		hashLines = []string{panelTitle("Manual hash", m.targetFocus == 1)}
+		for i, item := range m.manualTargetItems() {
+			line := truncate("  "+item.text, rightW-4)
+			if i == m.hashCursor && m.targetFocus == 1 {
+				line = highlightStyle.Render(truncate("> "+item.text, rightW-4))
+			}
+			hashLines = append(hashLines, line)
+		}
+	} else {
+		files := m.filteredHashFiles()
+		start, end := windowRange(m.hashCursor, len(files), contentH-1)
+		for i := start; i < end; i++ {
+			f := files[i]
+			mode := m.currentMode()
+			selected := m.selectedHashes[mode] != nil && m.selectedHashes[mode][f.Path].Path != ""
+			cursor := i == m.hashCursor && m.targetFocus == 1
+			line := checkboxLine(cursor, selected, f.Rel, scanner.FormatSize(f.Size), rightW-4)
+			hashLines = append(hashLines, line)
+		}
+		if len(files) == 0 {
+			hashLines = append(hashLines, mutedStyle.Render("No files in selected mode or filter."))
+		}
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top,
-		boxStyle.Width(leftW).Render(strings.Join(fitLines(modeLines, contentH), "\n")),
+		renderBox(leftW, modeLines, contentH),
 		" ",
-		boxStyle.Width(rightW).Render(strings.Join(fitLines(hashLines, contentH), "\n")),
+		renderBox(rightW, hashLines, contentH),
 	)
 }
 
@@ -456,12 +523,11 @@ func (m model) viewWordlists() string {
 	if len(files) == 0 {
 		lines = append(lines, mutedStyle.Render("No wordlists found or filter removed them."))
 	}
-	return boxStyle.Width(m.width - 4).Render(strings.Join(fitLines(lines, contentH), "\n"))
+	return renderBox(m.width-4, lines, contentH)
 }
 
 func (m model) viewHome() string {
-	leftW := max(44, m.width/2)
-	rightW := max(36, m.width-leftW-5)
+	leftW, rightW := splitPaneWidths(m.width, m.width/2, 44, 36)
 	contentH := m.bodyContentHeight()
 
 	lines := []string{panelTitle("Attack homepage", true)}
@@ -475,7 +541,7 @@ func (m model) viewHome() string {
 		line := checkboxLine(i == m.attCursor, selected, text, detail, leftW-4)
 		lines = append(lines, line)
 		if i == m.attCursor {
-			lines = append(lines, truncate("    "+mutedStyle.Render(p.Description), m.width-6))
+			lines = append(lines, mutedStyle.Render(truncate("    "+p.Description, paneTextWidth(leftW))))
 		}
 	}
 
@@ -492,9 +558,9 @@ func (m model) viewHome() string {
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top,
-		boxStyle.Width(leftW).Render(strings.Join(fitLines(lines, contentH), "\n")),
+		renderBox(leftW, lines, contentH),
 		" ",
-		boxStyle.Width(rightW).Render(strings.Join(fitLines(next, contentH), "\n")),
+		renderBox(rightW, next, contentH),
 	)
 }
 
@@ -509,7 +575,7 @@ func (m model) viewOptions() string {
 			lines = append(lines, "  "+row)
 		}
 	}
-	return boxStyle.Width(m.width - 4).Render(strings.Join(fitLines(lines, contentH), "\n"))
+	return renderBox(m.width-4, lines, contentH)
 }
 
 func (m model) viewQueue() string {
@@ -536,50 +602,19 @@ func (m model) viewQueue() string {
 		}
 		lines = append(lines, okStyle.Render(fmt.Sprintf("%d command(s) ready", len(m.plan.Commands))))
 	}
-	return boxStyle.Width(m.width - 4).Render(strings.Join(fitLines(lines, contentH), "\n"))
+	return renderBox(m.width-4, lines, contentH)
 }
 
 func (m model) viewRun() string {
-	leftW := max(32, m.width/3)
-	rightW := max(50, m.width-leftW-5)
+	leftW, rightW := splitPaneWidths(m.width, m.width/3, 24, 30)
 	contentH := m.bodyContentHeight()
 
-	left := []string{panelTitle("Current command", m.running)}
-	if strings.TrimSpace(m.current) == "" {
-		left = append(left, mutedStyle.Render("Waiting for first command."))
-	} else {
-		for _, line := range strings.Split(m.current, "\n") {
-			appendWrapped(&left, line, leftW-4)
-		}
-	}
-	left = append(left, "")
-	left = append(left, panelTitle("Status", m.running))
-	if strings.TrimSpace(m.status) == "" {
-		left = append(left, mutedStyle.Render("Press s or wait for --status."))
-	} else {
-		for _, line := range strings.Split(m.status, "\n") {
-			appendWrapped(&left, colorStatusLine(line), leftW-4)
-		}
-	}
-	left = append(left, "")
-	left = append(left, panelTitle("Cracked", m.running))
-	if len(m.cracked) == 0 {
-		left = append(left, mutedStyle.Render("New cracks from this run will appear here."))
-	} else {
-		end := min(len(m.cracked), contentH)
-		for _, line := range m.cracked[:end] {
-			appendWrapped(&left, colorCrackLine(line), leftW-4)
-		}
-	}
-	if m.runDone {
-		left = append(left, "")
-		left = append(left, okStyle.Render("Queue complete."))
-	}
+	left := m.runLeftPane(leftW, contentH)
 
 	right := []string{panelTitle("Raw hashcat output", true)}
 	rawRows := make([]string, 0, len(m.runLog))
 	for _, line := range m.runLog {
-		appendWrapped(&rawRows, line, rightW-4)
+		appendWrapped(&rawRows, line, paneTextWidth(rightW))
 	}
 	start := 0
 	maxLines := contentH
@@ -592,10 +627,179 @@ func (m model) viewRun() string {
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top,
-		boxStyle.Width(leftW).Render(strings.Join(fitLines(left, contentH), "\n")),
+		renderBox(leftW, left, contentH),
 		" ",
-		boxStyle.Width(rightW).Render(strings.Join(fitLines(right, contentH), "\n")),
+		renderBox(rightW, right, contentH),
 	)
+}
+
+func (m model) runLeftPane(width, height int) []string {
+	if height <= 0 {
+		return nil
+	}
+	innerW := paneTextWidth(width)
+	cmdLines := m.compactCommandLines(innerW, commandBudget(height))
+	statusLines := m.compactStatusLines(innerW, statusBudget(height))
+	doneLines := 0
+	if m.runDone {
+		doneLines = 2
+	}
+	crackBudget := height - len(cmdLines) - len(statusLines) - doneLines - 2
+	if crackBudget < 2 {
+		crackBudget = 2
+	}
+
+	var left []string
+	left = append(left, cmdLines...)
+	left = append(left, "")
+	left = append(left, statusLines...)
+	left = append(left, "")
+	left = append(left, m.compactCrackedLines(innerW, crackBudget)...)
+	if m.runDone && len(left) < height {
+		left = append(left, "", okStyle.Render("Queue complete."))
+	}
+	return fitLines(left, height)
+}
+
+func commandBudget(height int) int {
+	switch {
+	case height < 10:
+		return 2
+	case height < 14:
+		return 2
+	case height < 22:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func statusBudget(height int) int {
+	switch {
+	case height < 10:
+		return 3
+	case height < 14:
+		return 4
+	case height < 22:
+		return 6
+	default:
+		return 8
+	}
+}
+
+func (m model) compactCommandLines(width, budget int) []string {
+	lines := []string{panelTitle("Command", m.running)}
+	if budget <= 1 {
+		return lines
+	}
+	current := strings.TrimSpace(m.current)
+	if current == "" {
+		return append(lines, mutedStyle.Render("waiting"))
+	}
+	parts := strings.SplitN(current, "\n", 2)
+	label := strings.TrimSpace(parts[0])
+	if label != "" {
+		lines = append(lines, truncate(label, width))
+	}
+	if len(lines) >= budget {
+		return lines[:budget]
+	}
+	if len(parts) > 1 {
+		cmd := compactHashcatCommand(parts[1])
+		if cmd != "" {
+			lines = append(lines, mutedStyle.Render(truncate(cmd, width)))
+		}
+	}
+	return fitLines(lines, budget)
+}
+
+func compactHashcatCommand(cmd string) string {
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return ""
+	}
+	var out []string
+	for i := 0; i < len(fields); i++ {
+		f := fields[i]
+		base := strings.ToLower(filepathBase(f))
+		switch {
+		case i == 0:
+			out = append(out, base)
+		case f == "-m" || f == "-a" || f == "-d":
+			out = append(out, f)
+			if i+1 < len(fields) {
+				out = append(out, fields[i+1])
+				i++
+			}
+		case f == "-r" || f == "--potfile-path" || f == "--outfile":
+			out = append(out, f)
+			if i+1 < len(fields) {
+				out = append(out, filepathBase(fields[i+1]))
+				i++
+			}
+		case strings.HasPrefix(f, "-"):
+			out = append(out, f)
+		default:
+			out = append(out, filepathBase(f))
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+func (m model) compactStatusLines(width, budget int) []string {
+	lines := []string{panelTitle("Status", m.running)}
+	if budget <= 1 {
+		return lines
+	}
+	if strings.TrimSpace(m.status) == "" {
+		return append(lines, mutedStyle.Render("s requests status"))
+	}
+	values := parseStatusValues(m.status)
+	keys := []string{
+		"Status",
+		"Recovered",
+		"Time.Started",
+		"Time.Estimated",
+		"Progress",
+		"Speed.#01",
+		"Guess.Queue",
+		"Restore.Point",
+	}
+	for _, key := range keys {
+		if len(lines) >= budget {
+			break
+		}
+		if value, ok := values[key]; ok {
+			lines = append(lines, statusLine(key, value, width))
+		}
+	}
+	if len(lines) == 1 {
+		for _, line := range strings.Split(m.status, "\n") {
+			if len(lines) >= budget {
+				break
+			}
+			clean := strings.TrimSpace(line)
+			if clean != "" {
+				lines = append(lines, colorStatusLine(truncate(clean, width)))
+			}
+		}
+	}
+	return fitLines(lines, budget)
+}
+
+func (m model) compactCrackedLines(width, budget int) []string {
+	lines := []string{panelTitle("Cracked", m.running)}
+	if budget <= 1 {
+		return lines
+	}
+	if len(m.cracked) == 0 {
+		return append(lines, mutedStyle.Render("new cracks appear here"))
+	}
+	maxCracks := budget - 1
+	for _, line := range m.cracked[:min(len(m.cracked), maxCracks)] {
+		lines = append(lines, colorCrackLine(compactCrackRecord(line, width)))
+	}
+	return lines
 }
 
 func (m *model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -619,6 +823,20 @@ func (m *model) updateFilter(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.editField == "manual_hash" {
+		switch msg.String() {
+		case "esc":
+			m.editField = ""
+			m.hashEdit.Blur()
+			return m, nil
+		case "ctrl+s":
+			m.saveManualHashEdit()
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.hashEdit, cmd = m.hashEdit.Update(msg)
+		return m, cmd
+	}
 	switch msg.String() {
 	case "esc":
 		m.editField = ""
@@ -633,6 +851,13 @@ func (m *model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cewlURL = v
 		case "device":
 			m.options.Device = v
+		case "manual_mode":
+			if mode, err := strconv.Atoi(v); err == nil && mode >= 0 {
+				m.manualHashMode = mode
+				if len(manualHashLines(m.manualHash)) > 0 {
+					m.manualHashSelected = true
+				}
+			}
 		}
 		m.editField = ""
 		m.edit.Blur()
@@ -657,14 +882,20 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		switch m.step {
 		case stepTargets:
-			if msg.X < m.width/3+4 {
+			leftW, _ := splitPaneWidths(m.width, m.width/3, 28, 40)
+			if msg.X < leftW+2 {
 				m.targetFocus = 0
-				m.modeCursor = clamp(row-1, 0, len(m.inv.Modes)-1)
+				m.modeCursor = clamp(row-1, 0, m.modeRowCount()-1)
+				m.hashCursor = 0
 			} else {
 				m.targetFocus = 1
-				files := m.filteredHashFiles()
-				start, _ := windowRange(m.hashCursor, len(files), m.pageSize()-1)
-				m.hashCursor = clamp(start+row-1, 0, len(files)-1)
+				if m.isManualModeCursor() {
+					m.hashCursor = clamp(row-1, 0, len(m.manualTargetItems())-1)
+				} else {
+					files := m.filteredHashFiles()
+					start, _ := windowRange(m.hashCursor, len(files), m.pageSize()-1)
+					m.hashCursor = clamp(start+row-1, 0, len(files)-1)
+				}
 				m.toggleCurrent()
 			}
 		case stepWordlists:
@@ -712,8 +943,10 @@ func (m *model) moveCursor(delta int) {
 		m.attCursor = clamp(m.attCursor+delta, 0, len(m.filteredProcessors())-1)
 	case stepTargets:
 		if m.targetFocus == 0 {
-			m.modeCursor = clamp(m.modeCursor+delta, 0, len(m.inv.Modes)-1)
+			m.modeCursor = clamp(m.modeCursor+delta, 0, m.modeRowCount()-1)
 			m.hashCursor = 0
+		} else if m.isManualModeCursor() {
+			m.hashCursor = clamp(m.hashCursor+delta, 0, len(m.manualTargetItems())-1)
 		} else {
 			m.hashCursor = clamp(m.hashCursor+delta, 0, len(m.filteredHashFiles())-1)
 		}
@@ -732,11 +965,22 @@ func (m *model) toggleCurrent() {
 		m.selectCurrentProcessor()
 	case stepTargets:
 		if m.targetFocus == 0 {
-			mode := m.currentMode()
-			if len(m.selectedHashes[mode]) > 0 {
-				delete(m.selectedHashes, mode)
-			} else if files := m.filteredHashFiles(); len(files) > 0 {
-				m.selectHash(mode, files[0])
+			if m.isManualModeCursor() {
+				m.toggleManualTarget()
+			} else {
+				mode := m.currentMode()
+				if len(m.selectedHashes[mode]) > 0 {
+					delete(m.selectedHashes, mode)
+				} else if files := m.filteredHashFiles(); len(files) > 0 {
+					m.selectHash(mode, files[0])
+				}
+			}
+		} else if m.isManualModeCursor() {
+			switch m.manualTargetKey() {
+			case "mode", "hash":
+				m.beginEdit()
+			default:
+				m.toggleManualTarget()
 			}
 		} else {
 			files := m.filteredHashFiles()
@@ -762,9 +1006,25 @@ func (m *model) toggleCurrent() {
 	m.planDirty = true
 }
 
+func (m *model) toggleManualTarget() {
+	if len(manualHashLines(m.manualHash)) == 0 {
+		m.targetFocus = 1
+		m.hashCursor = 2
+		m.beginEdit()
+		return
+	}
+	m.manualHashSelected = !m.manualHashSelected
+}
+
 func (m *model) selectAllFiltered() {
 	switch m.step {
 	case stepTargets:
+		if m.isManualModeCursor() {
+			if len(manualHashLines(m.manualHash)) > 0 {
+				m.manualHashSelected = true
+			}
+			break
+		}
 		for _, f := range m.filteredHashFiles() {
 			m.selectHash(m.currentMode(), f)
 		}
@@ -779,7 +1039,11 @@ func (m *model) selectAllFiltered() {
 func (m *model) clearCurrentSelection() {
 	switch m.step {
 	case stepTargets:
-		delete(m.selectedHashes, m.currentMode())
+		if m.isManualModeCursor() {
+			m.manualHashSelected = false
+		} else {
+			delete(m.selectedHashes, m.currentMode())
+		}
 	case stepWordlists:
 		m.selectedWordlists = map[string]scanner.FileRef{}
 	case stepHome:
@@ -822,6 +1086,27 @@ func (m *model) adjustOption(delta int) {
 }
 
 func (m *model) beginEdit() {
+	if m.step == stepTargets {
+		if m.isManualModeCursor() && m.targetFocus == 1 {
+			switch m.manualTargetKey() {
+			case "mode":
+				m.editField = "manual_mode"
+				m.edit.SetValue(strconv.Itoa(m.manualHashMode))
+			case "hash", "use":
+				m.editField = "manual_hash"
+				m.hashEdit.SetValue(m.manualHash)
+				m.configureManualHashEditor()
+				_ = m.hashEdit.Focus()
+			default:
+				return
+			}
+			if m.editField != "manual_hash" {
+				m.edit.Focus()
+				m.edit.CursorEnd()
+			}
+		}
+		return
+	}
 	switch m.optionKey() {
 	case "seed":
 		m.editField = "seed"
@@ -839,9 +1124,70 @@ func (m *model) beginEdit() {
 	m.edit.CursorEnd()
 }
 
+func (m *model) saveManualHashEdit() {
+	v := normalizeManualHashes(m.hashEdit.Value())
+	m.manualHash = v
+	m.manualHashSelected = v != ""
+	m.editField = ""
+	m.hashEdit.Blur()
+	m.planDirty = true
+}
+
+func (m *model) configureManualHashEditor() {
+	width := max(20, m.width-10)
+	height := clamp(m.height/3, 5, 14)
+	if m.height > 0 {
+		height = min(height, max(3, m.height-12))
+	}
+	m.hashEdit.SetWidth(width)
+	m.hashEdit.SetHeight(height)
+}
+
 type optionRowItem struct {
 	key  string
 	text string
+}
+
+type manualTargetItem struct {
+	key  string
+	text string
+}
+
+func (m model) manualTargetItems() []manualTargetItem {
+	hashes := manualHashLines(m.manualHash)
+	selected := m.manualHashSelected && len(hashes) > 0
+	hash := "(empty)"
+	if len(hashes) == 1 {
+		hash = truncateMiddle(hashes[0], 48)
+	} else if len(hashes) > 1 {
+		hash = fmt.Sprintf("%d hashes, first %s", len(hashes), truncateMiddle(hashes[0], 32))
+	}
+	hint := "space toggles; empty opens hash input"
+	if len(hashes) > 1 {
+		hint = fmt.Sprintf("%d hashes", len(hashes))
+	}
+	label := "Hash"
+	if len(hashes) != 1 {
+		label = "Hashes"
+	}
+	if len(hashes) == 0 {
+		hash = "(empty)"
+	} else {
+		hash = truncate(hash, 72)
+	}
+	return []manualTargetItem{
+		{"use", boolRow("Use manual hashes", selected, hint)},
+		{"mode", fmt.Sprintf("Hashcat mode: %d", m.manualHashMode)},
+		{"hash", label + ": " + hash},
+	}
+}
+
+func (m model) manualTargetKey() string {
+	items := m.manualTargetItems()
+	if len(items) == 0 {
+		return ""
+	}
+	return items[clamp(m.hashCursor, 0, len(items)-1)].key
 }
 
 func (m model) optionRows() []string {
@@ -900,6 +1246,18 @@ func (m *model) rebuildPlan() {
 		}
 		sort.Slice(hashes[mode], func(i, j int) bool { return hashes[mode][i].Rel < hashes[mode][j].Rel })
 	}
+	var warnings []string
+	if m.manualHashSelected && len(manualHashLines(m.manualHash)) > 0 {
+		f, err := m.manualHashFile()
+		if err != nil {
+			warnings = append(warnings, "manual hash: "+err.Error())
+		} else {
+			hashes[m.manualHashMode] = append(hashes[m.manualHashMode], f)
+			sort.Slice(hashes[m.manualHashMode], func(i, j int) bool {
+				return hashes[m.manualHashMode][i].Rel < hashes[m.manualHashMode][j].Rel
+			})
+		}
+	}
 	wordlists := make([]scanner.FileRef, 0, len(m.selectedWordlists))
 	for _, f := range m.selectedWordlists {
 		wordlists = append(wordlists, f)
@@ -925,8 +1283,35 @@ func (m *model) rebuildPlan() {
 		CeWLURL:    m.cewlURL,
 		TempDir:    m.tempDir,
 	})
+	if len(warnings) > 0 {
+		m.plan.Warnings = append(warnings, m.plan.Warnings...)
+	}
 	m.planDirty = false
 	m.prevCursor = clamp(m.prevCursor, 0, len(m.plan.Commands)-1)
+}
+
+func (m model) manualHashFile() (scanner.FileRef, error) {
+	hashes := manualHashLines(m.manualHash)
+	if len(hashes) == 0 {
+		return scanner.FileRef{}, fmt.Errorf("hash list is empty")
+	}
+	body := strings.Join(hashes, "\n") + "\n"
+	dir := filepath.Join(m.tempDir, "hashes")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return scanner.FileRef{}, err
+	}
+	sum := sha1.Sum([]byte(strconv.Itoa(m.manualHashMode) + "\x00" + body))
+	name := fmt.Sprintf("goCrack-manual-m%d-%s.hash", m.manualHashMode, hex.EncodeToString(sum[:6]))
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		return scanner.FileRef{}, err
+	}
+	return scanner.FileRef{
+		Name: name,
+		Rel:  fmt.Sprintf("manual:%d-hashes", len(hashes)),
+		Path: path,
+		Size: int64(len(body)),
+	}, nil
 }
 
 func (m *model) selectHash(mode int, f scanner.FileRef) {
@@ -951,6 +1336,9 @@ func (m *model) toggleHash(mode int, f scanner.FileRef) {
 }
 
 func (m model) currentMode() int {
+	if m.isManualModeCursor() {
+		return m.manualHashMode
+	}
 	if len(m.inv.Modes) == 0 {
 		return m.cfg.Mode
 	}
@@ -958,7 +1346,7 @@ func (m model) currentMode() int {
 }
 
 func (m model) filteredHashFiles() []scanner.FileRef {
-	if len(m.inv.Modes) == 0 {
+	if m.isManualModeCursor() || len(m.inv.Modes) == 0 {
 		return nil
 	}
 	files := m.inv.Modes[clamp(m.modeCursor, 0, len(m.inv.Modes)-1)].Files
@@ -973,6 +1361,14 @@ func (m model) filteredHashFiles() []scanner.FileRef {
 		}
 	}
 	return out
+}
+
+func (m model) modeRowCount() int {
+	return len(m.inv.Modes) + 1
+}
+
+func (m model) isManualModeCursor() bool {
+	return m.modeCursor >= len(m.inv.Modes)
 }
 
 func (m model) filteredWordlists() []scanner.FileRef {
@@ -1005,7 +1401,12 @@ func (m model) filteredProcessors() []planner.Processor {
 }
 
 func (m *model) clampCursors() {
-	m.hashCursor = clamp(m.hashCursor, 0, len(m.filteredHashFiles())-1)
+	m.modeCursor = clamp(m.modeCursor, 0, m.modeRowCount()-1)
+	if m.isManualModeCursor() {
+		m.hashCursor = clamp(m.hashCursor, 0, len(m.manualTargetItems())-1)
+	} else {
+		m.hashCursor = clamp(m.hashCursor, 0, len(m.filteredHashFiles())-1)
+	}
 	m.wordCursor = clamp(m.wordCursor, 0, len(m.filteredWordlists())-1)
 	m.attCursor = clamp(m.attCursor, 0, len(m.filteredProcessors())-1)
 }
@@ -1014,6 +1415,9 @@ func (m model) selectedHashCount() int {
 	total := 0
 	for _, set := range m.selectedHashes {
 		total += len(set)
+	}
+	if m.manualHashSelected {
+		total += len(manualHashLines(m.manualHash))
 	}
 	return total
 }
@@ -1153,6 +1557,99 @@ func colorStatusLine(line string) string {
 	return line
 }
 
+func colorStatusPair(label, value string) string {
+	return activeStyle.Render(label+":") + " " + valueStyle.Render(value)
+}
+
+func statusLine(label, value string, width int) string {
+	display := statusDisplayLabel(label, width)
+	prefix := display + ": "
+	valueWidth := max(1, width-lipgloss.Width(prefix))
+	return colorStatusPair(display, compactStatusValue(label, value, valueWidth))
+}
+
+func statusDisplayLabel(label string, width int) string {
+	if width >= 36 {
+		return label
+	}
+	switch label {
+	case "Status":
+		return "State"
+	case "Recovered":
+		return "Rec"
+	case "Progress":
+		return "Prog"
+	case "Speed.#01":
+		return "Speed"
+	case "Time.Started":
+		return "Start"
+	case "Time.Estimated":
+		return "ETA"
+	case "Guess.Queue":
+		return "Queue"
+	case "Restore.Point":
+		return "Restore"
+	default:
+		return label
+	}
+}
+
+func parseStatusValues(status string) map[string]string {
+	values := map[string]string{}
+	for _, line := range strings.Split(status, "\n") {
+		line = strings.TrimSpace(line)
+		idx := strings.Index(line, ":")
+		if idx <= 0 {
+			continue
+		}
+		label := strings.TrimRight(strings.TrimSpace(line[:idx]), ".")
+		value := strings.TrimSpace(line[idx+1:])
+		if label == "" || value == "" {
+			continue
+		}
+		values[label] = value
+		if strings.HasPrefix(label, "Speed.#") {
+			if _, ok := values["Speed.#01"]; !ok {
+				values["Speed.#01"] = value
+			}
+		}
+	}
+	return values
+}
+
+func compactStatusValue(label, value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	switch label {
+	case "Time.Started", "Time.Estimated":
+		if idx := strings.Index(value, "("); idx > 0 {
+			value = strings.TrimSpace(value[:idx])
+		}
+		value = compactHashcatTime(value, width)
+	case "Recovered", "Progress", "Restore.Point":
+		if idx := strings.Index(value, " Digests"); idx > 0 {
+			value = value[:idx]
+		}
+	}
+	return truncate(value, width)
+}
+
+func compactHashcatTime(value string, width int) string {
+	fields := strings.Fields(value)
+	if len(fields) < 4 || width >= 22 {
+		return value
+	}
+	clock := fields[3]
+	if len(clock) >= 5 {
+		clock = clock[:5]
+	}
+	if width < 10 {
+		return clock
+	}
+	return strings.Join([]string{fields[1], fields[2], clock}, " ")
+}
+
 func colorCrackLine(line string) string {
 	line = strings.TrimSpace(line)
 	prefix := ""
@@ -1166,6 +1663,48 @@ func colorCrackLine(line string) string {
 		return prefix + hashStyle.Render(hash) + mutedStyle.Render(":") + plainStyle.Render(plain)
 	}
 	return prefix + plainStyle.Render(line)
+}
+
+func compactCrackRecord(line string, width int) string {
+	line = strings.TrimSpace(line)
+	prefix := ""
+	if strings.HasPrefix(line, "* ") {
+		prefix = "* "
+		line = strings.TrimSpace(strings.TrimPrefix(line, "* "))
+		width -= 2
+	}
+	if width <= 0 {
+		return strings.TrimSpace(prefix)
+	}
+	if width < 12 {
+		return prefix + truncate(line, width)
+	}
+	idx := strings.LastIndex(line, ":")
+	if idx <= 0 || idx+1 >= len(line) {
+		return prefix + truncate(line, width)
+	}
+	hash := line[:idx]
+	plain := line[idx+1:]
+	plainBudget := min(24, max(4, width/3))
+	hashBudget := width - plainBudget - 1
+	if hashBudget < 4 {
+		hashBudget = max(1, width-5)
+		plainBudget = max(1, width-hashBudget-1)
+	}
+	return prefix + truncateMiddle(hash, hashBudget) + ":" + truncate(plain, plainBudget)
+}
+
+func filepathBase(path string) string {
+	path = strings.Trim(path, `"'`)
+	path = strings.TrimRight(path, `/\`)
+	if path == "" {
+		return path
+	}
+	idx := strings.LastIndexAny(path, `/\`)
+	if idx >= 0 && idx+1 < len(path) {
+		return path[idx+1:]
+	}
+	return path
 }
 
 func emptyValue(s string) string {
@@ -1203,6 +1742,60 @@ func fitLines(lines []string, height int) []string {
 	return lines[:height]
 }
 
+func fitPaneLines(lines []string, height, width int) []string {
+	lines = fitLines(lines, height)
+	if width <= 0 {
+		for i := range lines {
+			lines[i] = ""
+		}
+		return lines
+	}
+	for i := range lines {
+		lines[i] = clampCells(lines[i], width)
+	}
+	return lines
+}
+
+func renderBox(width int, lines []string, height int) string {
+	width = max(1, width)
+	return boxStyle.Width(width).Render(strings.Join(fitPaneLines(lines, height, paneTextWidth(width)), "\n"))
+}
+
+func splitPaneWidths(total, desiredLeft, minLeft, minRight int) (int, int) {
+	const gap = 5 // both borders plus the visible space between panes
+	if total <= gap+2 {
+		return 1, 1
+	}
+	if total >= minLeft+minRight+gap {
+		maxLeft := total - minRight - gap
+		left := clamp(desiredLeft, minLeft, maxLeft)
+		return left, total - left - gap
+	}
+
+	minCompact := 8
+	maxLeft := max(minCompact, total-gap-minCompact)
+	left := clamp(desiredLeft, minCompact, maxLeft)
+	right := total - left - gap
+	if right < 1 {
+		right = 1
+	}
+	return left, right
+}
+
+func paneTextWidth(boxWidth int) int {
+	return max(1, boxWidth-2)
+}
+
+func clampCells(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	return ansi.Truncate(s, width, "")
+}
+
 func waitEvent(ch <-chan runner.Event) tea.Cmd {
 	return func() tea.Msg {
 		ev, ok := <-ch
@@ -1215,6 +1808,23 @@ func waitEvent(ch <-chan runner.Event) tea.Cmd {
 
 func splitWords(s string) []string {
 	return strings.Fields(s)
+}
+
+func normalizeManualHashes(s string) string {
+	return strings.Join(manualHashLines(s), "\n")
+}
+
+func manualHashLines(s string) []string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	var hashes []string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			hashes = append(hashes, line)
+		}
+	}
+	return hashes
 }
 
 func processorOrder(id string) int {
@@ -1234,14 +1844,23 @@ func truncate(s string, width int) string {
 	if width <= 0 {
 		return ""
 	}
+	return ansi.Truncate(s, width, "...")
+}
+
+func truncateMiddle(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	r := []rune(s)
 	if len(r) <= width {
 		return s
 	}
-	if width <= 1 {
-		return string(r[:width])
+	if width <= 3 {
+		return truncate(s, width)
 	}
-	return string(r[:width-1]) + "..."
+	left := (width - 3) / 2
+	right := width - 3 - left
+	return string(r[:left]) + "..." + string(r[len(r)-right:])
 }
 
 func appendWrapped(dst *[]string, s string, width int) {

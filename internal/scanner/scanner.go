@@ -125,7 +125,9 @@ func ScanFiles(root string) ([]FileRef, error) {
 
 func isGeneratedGoCrackFile(name string) bool {
 	lower := strings.ToLower(name)
-	return strings.HasPrefix(lower, "gocrack-combined-") || strings.HasPrefix(lower, "live-cracks-")
+	return strings.HasPrefix(lower, "gocrack-combined-") ||
+		strings.HasPrefix(lower, "gocrack-manual-") ||
+		strings.HasPrefix(lower, "live-cracks-")
 }
 
 func ScanRules(root string) ([]RuleRef, error) {

@@ -258,7 +258,8 @@ func cleanupCombinedHashTargets(commands []planner.Command, tempDir string) {
 			continue
 		}
 		seen[cmd.Hashlist] = true
-		if !strings.HasPrefix(filepath.Base(cmd.Hashlist), "goCrack-combined-") {
+		base := filepath.Base(cmd.Hashlist)
+		if !strings.HasPrefix(base, "goCrack-combined-") && !strings.HasPrefix(base, "goCrack-manual-") {
 			continue
 		}
 		absPath, err := filepath.Abs(cmd.Hashlist)
@@ -271,6 +272,25 @@ func cleanupCombinedHashTargets(commands []planner.Command, tempDir string) {
 		}
 		removeFile(absPath)
 	}
+	cleanupGeneratedHashFiles(absRoot, "goCrack-manual-")
+}
+
+func cleanupGeneratedHashFiles(absRoot, prefix string) {
+	_ = filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasPrefix(filepath.Base(path), prefix) {
+			return nil
+		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(absRoot, absPath)
+		if err != nil || rel == "." || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			return nil
+		}
+		removeFile(absPath)
+		return nil
+	})
 }
 
 func removeFile(path string) {
