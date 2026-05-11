@@ -1,0 +1,33 @@
+# Local machine configuration. Commit config.example.json instead.
+config.json
+*.local.json
+
+# Built binaries and test artifacts.
+goCrack
+goCrack.exe
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.out
+
+# Temporary/generated working data.
+.tmp/
+tmp/
+temp/
+goCrack-*/
+live-cracks-*.out
+goCrack-combined-*.hashes
+
+# Hashcat/runtime output that may contain local paths or recovered material.
+hashcat.potfile
+*.potfile
+*.restore
+*.log
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

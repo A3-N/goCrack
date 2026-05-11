@@ -1,0 +1,13 @@
+{
+  "hashcat": "",
+  "rulelists": "",
+  "wordlists": "",
+  "hashes": "",
+  "potfile": "",
+  "mode": 1000,
+  "modes": [],
+  "loopback": true,
+  "kernel": false,
+  "hwmon": true,
+  "rule_files": {}
+}
