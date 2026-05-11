@@ -94,7 +94,6 @@ var (
 	hashStyle      = lipgloss.NewStyle().Foreground(hashC)
 	plainStyle     = lipgloss.NewStyle().Foreground(plainC).Bold(true)
 	valueStyle     = lipgloss.NewStyle().Foreground(valueC)
-	controlStyle   = lipgloss.NewStyle().Foreground(warn).Bold(true)
 	boxStyle       = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("238")).Padding(0, 1)
 )
 
@@ -357,12 +356,7 @@ func (m model) header() string {
 		parts = append(parts, part)
 	}
 	line := titleStyle.Render("goCrack") + "  " + strings.Join(parts, "  ")
-	attack := m.selectedProcessorName()
-	if attack == "" {
-		attack = "none"
-	}
-	stats := fmt.Sprintf("attack:%s targets:%d wordlists:%d rules:%d", attack, m.selectedHashCount(), len(m.selectedWordlists), len(m.inv.Rules))
-	return line + "\n" + mutedStyle.Render(m.root+"  "+stats)
+	return line
 }
 
 func (m model) help() string {
@@ -558,12 +552,6 @@ func (m model) viewRun() string {
 			appendWrapped(&left, line, leftW-4)
 		}
 	}
-	left = append(left, "")
-	left = append(left, panelTitle("Controls", m.running))
-	left = append(left, controlLine("s", "status"))
-	left = append(left, controlLine("b", "bypass/skip"))
-	left = append(left, controlLine("q", "quit hashcat"))
-	left = append(left, controlLine("esc", "force cancel"))
 	left = append(left, "")
 	left = append(left, panelTitle("Status", m.running))
 	if strings.TrimSpace(m.status) == "" {
@@ -1154,10 +1142,6 @@ func boolRow(label string, v bool, hint string) string {
 		state = "[" + okStyle.Render("x") + "]"
 	}
 	return fmt.Sprintf("%s %s  %s", state, label, mutedStyle.Render(hint))
-}
-
-func controlLine(key, label string) string {
-	return controlStyle.Render(key) + "  " + label
 }
 
 func colorStatusLine(line string) string {
