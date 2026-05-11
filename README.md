@@ -1,8 +1,8 @@
 # goCrack
 
-`goCrack` is a Go Bubble Tea/Lipgloss TUI for orchestrating hashcat. It reads an app-local `config.json`, scans the configured `hashes`, `wordlists`, and `rules` directories, then builds previewable hashcat command queues.
+`goCrack` is a Go Bubble Tea/Lipgloss TUI for orchestrating hashcat. It reads `~/.config/goCrack/config.json`, scans the configured `hashes`, `wordlists`, and `rules` directories, then builds previewable hashcat command queues.
 
-On first startup, goCrack checks for configured paths. If `config.json` is missing or required dependencies cannot be found, it tries PATH and nearby relative directories first, then opens an interactive path picker for anything still missing. Set `GOCRACK_CONFIG` to point at a different config file.
+On first startup, goCrack checks for configured paths. If `~/.config/goCrack/config.json` is missing or required dependencies cannot be found, it tries PATH and nearby relative directories first, then opens an interactive path picker for anything still missing. Set `GOCRACK_CONFIG` to point at a different config file. If an older app-local `config.json` is present, goCrack reads it once and saves the migrated config to `~/.config/goCrack/config.json`.
 
 ## Run
 
@@ -16,6 +16,19 @@ Or build it:
 ```powershell
 go build -o goCrack.exe .
 .\goCrack.exe
+```
+
+Install it:
+
+```powershell
+make install
+```
+
+`make install` builds `goCrack` into `~/.local/bin` by default and creates the config directory. Override the destination with `BINDIR` or `PREFIX`:
+
+```powershell
+$env:BINDIR = "$HOME\bin"
+make install
 ```
 
 ## Flow

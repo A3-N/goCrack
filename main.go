@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -25,6 +27,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	migrated := false
+	if !found && strings.TrimSpace(os.Getenv(config.ConfigEnv)) == "" {
+		cfg, found, migrated, err = loadLegacyConfig(configPath, cfg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+
 	setupRan := false
 	if !found || len(config.RequiredIssues(cfg)) > 0 {
 		var ok bool
@@ -40,7 +51,7 @@ func main() {
 		setupRan = true
 	}
 
-	if !found || setupRan {
+	if !found || setupRan || migrated {
 		if err := config.Save(configPath, cfg); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -79,4 +90,33 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func loadLegacyConfig(configPath string, fallback config.Settings) (config.Settings, bool, bool, error) {
+	absConfig, err := filepathAbs(configPath)
+	if err != nil {
+		return fallback, false, false, err
+	}
+	for _, legacyPath := range config.LegacyPaths() {
+		absLegacy, err := filepathAbs(legacyPath)
+		if err != nil || absLegacy == absConfig {
+			continue
+		}
+		cfg, found, err := config.Load(absLegacy)
+		if err != nil {
+			return fallback, false, false, err
+		}
+		if found {
+			return cfg, true, true, nil
+		}
+	}
+	return fallback, false, false, nil
+}
+
+func filepathAbs(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(abs), nil
 }

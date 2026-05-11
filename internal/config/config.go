@@ -43,14 +43,22 @@ func DefaultPath() (string, error) {
 	if p := strings.TrimSpace(os.Getenv(ConfigEnv)); p != "" {
 		return filepath.Abs(expandPath(p))
 	}
-	if wd, err := os.Getwd(); err == nil && looksLikeAppDir(wd) {
-		return filepath.Join(wd, "config.json"), nil
-	}
-	dir, err := AppDir()
+	dir, err := ConfigDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "config.json"), nil
+}
+
+func ConfigDir() (string, error) {
+	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+		return filepath.Abs(filepath.Join(expandPath(xdg), "goCrack"))
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "goCrack"), nil
 }
 
 func AppDir() (string, error) {
@@ -62,6 +70,31 @@ func AppDir() (string, error) {
 		return filepath.Dir(exe), nil
 	}
 	return os.Getwd()
+}
+
+func LegacyPaths() []string {
+	var paths []string
+	if wd, err := os.Getwd(); err == nil && looksLikeAppDir(wd) {
+		paths = append(paths, filepath.Join(wd, "config.json"))
+	}
+	if dir, err := AppDir(); err == nil {
+		paths = append(paths, filepath.Join(dir, "config.json"))
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, path := range paths {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			continue
+		}
+		key := strings.ToLower(abs)
+		if seen[key] || !isFile(abs) {
+			continue
+		}
+		seen[key] = true
+		out = append(out, abs)
+	}
+	return out
 }
 
 func looksLikeAppDir(dir string) bool {

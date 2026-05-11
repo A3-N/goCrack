@@ -1,11 +1,13 @@
 # Local machine configuration. Commit config.example.json instead.
 config.json
 *.local.json
+.config/
 
 # Built binaries and test artifacts.
 goCrack
 goCrack.exe
 *.exe
+*.exe~
 *.test
 *.out
 coverage.txt
@@ -15,9 +17,10 @@ coverage.out
 .tmp/
 tmp/
 temp/
-goCrack-*/
+/goCrack-*/
 live-cracks-*.out
 goCrack-combined-*.hashes
+goCrack-manual-*.hash
 
 # Hashcat/runtime output that may contain local paths or recovered material.
 hashcat.potfile
